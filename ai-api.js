@@ -346,6 +346,7 @@ async function processRequest(userMessage, intent, context = {}) {
   const normalizedContext = Array.isArray(context)
     ? { sameIntentHistory: context, channelContext: [] }
     : context;
+  const availableTools = normalizedContext.availableTools || toolsList;
 
   const formattedHistory = formatSameIntentHistory(
     normalizedContext.sameIntentHistory,
@@ -359,7 +360,7 @@ async function processRequest(userMessage, intent, context = {}) {
     intent,
     history: formattedHistory,
     channelContext: formattedChannelContext,
-    availableTools: JSON.stringify(toolsList, null, 2),
+    availableTools: JSON.stringify(availableTools, null, 2),
   });
 
   const messages = [
@@ -471,10 +472,10 @@ async function executeAction(action) {
   }
 }
 
-async function reviewToolCustomizationRequest(requestText) {
+async function reviewToolCustomizationRequest(requestText, availableTools = toolsList) {
   const rendered = renderPrompt(toolCustomizationReviewTemplate, {
     requestText,
-    availableTools: JSON.stringify(toolsList, null, 2),
+    availableTools: JSON.stringify(availableTools, null, 2),
   });
 
   const messages = [

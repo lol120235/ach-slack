@@ -16,7 +16,16 @@ const {
   toolsList,
 } = require("./prompts.js");
 
-const { getHistory, updateHistory, initUser } = require("./database-users.js");
+const {
+  getHistory,
+  updateHistory,
+  initUser,
+  listChatHistory,
+  getChatHistoryRecord,
+  updateChatHistoryRecord,
+  deleteChatHistoryRecord,
+  clearChatHistory,
+} = require("./database-users.js");
 const {
   getSetting,
   setSetting,
@@ -26,8 +35,10 @@ const {
 
 const CONTEXT_MESSAGE_LIMIT = 15;
 const PERSONALITY_PROMPT_SETTING_KEY = "personality_system_prompt";
+const DISABLED_TOOLS_SETTING_KEY = "disabled_tools";
 const MAX_PERSONALITY_PROMPT_CHARS = 4000;
 const MAX_TOOL_REQUEST_CHARS = 4000;
+const DEFAULT_HISTORY_COMMAND_LIMIT = 10;
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -43,11 +54,53 @@ function slackCodeBlock(value) {
   return `\`\`\`\n${String(value).replace(/```/g, "'''")}\n\`\`\``;
 }
 
-function formatToolsForSlack() {
-  return toolsList
+function parseJsonSetting(key, fallback) {
+  const rawValue = getSetting(key);
+  if (!rawValue) return fallback;
+
+  try {
+    return JSON.parse(rawValue);
+  } catch (error) {
+    console.warn(`[WARN] Failed to parse setting ${key}: ${error.message}`);
+    return fallback;
+  }
+}
+
+function getDisabledToolNames() {
+  const value = parseJsonSetting(DISABLED_TOOLS_SETTING_KEY, []);
+  if (!Array.isArray(value)) return new Set();
+
+  return new Set(
+    value
+      .map((name) => String(name || "").trim())
+      .filter(Boolean),
+  );
+}
+
+function saveDisabledToolNames(disabledToolNames) {
+  setSetting(
+    DISABLED_TOOLS_SETTING_KEY,
+    JSON.stringify([...disabledToolNames].sort()),
+  );
+}
+
+function getActiveTools() {
+  const disabledToolNames = getDisabledToolNames();
+  return toolsList.filter((tool) => !disabledToolNames.has(tool.name));
+}
+
+function getToolByName(toolName) {
+  return toolsList.find((tool) => tool.name === toolName);
+}
+
+function formatToolsForSlack(toolList = toolsList) {
+  const disabledToolNames = getDisabledToolNames();
+
+  return toolList
     .map((tool) => {
       const parameters = Object.keys(tool.parameters || {}).join(", ");
-      return `- ${tool.name}: ${tool.description} Parameters: ${parameters || "none"}.`;
+      const status = disabledToolNames.has(tool.name) ? "disabled" : "active";
+      return `- ${tool.name} (${status}): ${tool.description} Parameters: ${parameters || "none"}.`;
     })
     .join("\n");
 }
@@ -74,6 +127,34 @@ function normalizeToolReview(review) {
         ? review.implementation_notes
         : [],
   };
+}
+
+function parseHistoryListArgs(args) {
+  if (args[0] === "intent") {
+    return {
+      intent: args[1],
+      limit: args[2] || DEFAULT_HISTORY_COMMAND_LIMIT,
+    };
+  }
+
+  return {
+    intent: null,
+    limit: args[0] || DEFAULT_HISTORY_COMMAND_LIMIT,
+  };
+}
+
+function formatHistoryRecord(record) {
+  const content = String(record.message_content || "").replace(/\s+/g, " ");
+  const clippedContent =
+    content.length > 160 ? `${content.slice(0, 157)}...` : content;
+
+  return `#${record.message_id} [${record.intent}] ${record.created_at}: ${clippedContent}`;
+}
+
+function formatHistoryRecords(records) {
+  if (!records.length) return "No chat history rows found.";
+
+  return records.map(formatHistoryRecord).join("\n");
 }
 
 function normalizeSlackMessage(message) {
@@ -248,7 +329,7 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
 
   let review;
   try {
-    review = await reviewToolCustomizationRequest(requestText);
+    review = await reviewToolCustomizationRequest(requestText, getActiveTools());
   } catch (error) {
     const failureReason = error.safeSummary || error.message || "Unknown error";
     console.error(
@@ -302,6 +383,212 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
   });
 });
 
+app.command("/ach-remove-tool", async ({ command, ack, respond }) => {
+  await ack();
+  logProgress("tools", "Remove-tool command acknowledged.");
+
+  const { user_id: userId, user_name: username } = command;
+  const text = (command.text || "").trim();
+  const args = text.split(/\s+/).filter(Boolean);
+  const subcommand = (args[0] || "help").toLowerCase();
+
+  initUser(userId, username);
+
+  if (subcommand === "help") {
+    await respond({
+      text:
+        "Tool removal disables tools at runtime; it does not delete source code.\n\n" +
+        "Usage:\n" +
+        "- `/ach-remove-tool list`\n" +
+        "- `/ach-remove-tool disable <tool_name>`\n" +
+        "- `/ach-remove-tool enable <tool_name>`\n" +
+        "- `/ach-remove-tool reset`\n\n" +
+        "Known tools:\n" +
+        formatToolsForSlack(),
+    });
+    return;
+  }
+
+  if (subcommand === "list") {
+    await respond({
+      text: "Known tools:\n" + formatToolsForSlack(),
+    });
+    return;
+  }
+
+  if (subcommand === "reset") {
+    deleteSetting(DISABLED_TOOLS_SETTING_KEY);
+    await respond({ text: "All tools have been re-enabled." });
+    return;
+  }
+
+  if (subcommand !== "disable" && subcommand !== "enable") {
+    await respond({
+      text: "Unknown command. Try `/ach-remove-tool help`.",
+    });
+    return;
+  }
+
+  const toolName = args[1];
+  if (!toolName || !getToolByName(toolName)) {
+    await respond({
+      text:
+        "Please provide a known tool name.\n\nKnown tools:\n" +
+        formatToolsForSlack(),
+    });
+    return;
+  }
+
+  const disabledToolNames = getDisabledToolNames();
+
+  if (subcommand === "disable") {
+    disabledToolNames.add(toolName);
+    saveDisabledToolNames(disabledToolNames);
+    await respond({
+      text: `Tool disabled: ${toolName}. It will no longer be shown to the model or executed.`,
+    });
+    return;
+  }
+
+  disabledToolNames.delete(toolName);
+  saveDisabledToolNames(disabledToolNames);
+  await respond({
+    text: `Tool enabled: ${toolName}.`,
+  });
+});
+
+app.command("/ach-history", async ({ command, ack, respond }) => {
+  await ack();
+  logProgress("history", "History command acknowledged.");
+
+  const { user_id: userId, user_name: username } = command;
+  const text = (command.text || "").trim();
+  const args = text.split(/\s+/).filter(Boolean);
+  const subcommand = (args[0] || "help").toLowerCase();
+
+  initUser(userId, username);
+
+  if (subcommand === "help") {
+    await respond({
+      text:
+        "Usage:\n" +
+        "- `/ach-history list [limit]`\n" +
+        "- `/ach-history list intent <intent> [limit]`\n" +
+        "- `/ach-history show <message_id>`\n" +
+        "- `/ach-history set <message_id> <new message text>`\n" +
+        "- `/ach-history set-intent <message_id> <intent>`\n" +
+        "- `/ach-history delete <message_id>`\n" +
+        "- `/ach-history clear`\n" +
+        "- `/ach-history clear intent <intent>`",
+    });
+    return;
+  }
+
+  if (subcommand === "list") {
+    const { intent, limit } = parseHistoryListArgs(args.slice(1));
+    const records = listChatHistory(userId, { intent, limit });
+    await respond({
+      text: slackCodeBlock(formatHistoryRecords(records)),
+    });
+    return;
+  }
+
+  if (subcommand === "show") {
+    const messageId = args[1];
+    const record = getChatHistoryRecord(userId, messageId);
+
+    if (!record) {
+      await respond({ text: `No chat history row found for #${messageId}.` });
+      return;
+    }
+
+    await respond({
+      text:
+        `Chat history #${record.message_id}\n` +
+        `Intent: ${record.intent}\n` +
+        `Created: ${record.created_at}\n` +
+        "Content:\n" +
+        slackCodeBlock(record.message_content || ""),
+    });
+    return;
+  }
+
+  if (subcommand === "set") {
+    const messageId = args[1];
+    const nextContent = args.slice(2).join(" ").trim();
+
+    if (!messageId || !nextContent) {
+      await respond({
+        text: "Usage: `/ach-history set <message_id> <new message text>`",
+      });
+      return;
+    }
+
+    const updated = updateChatHistoryRecord(userId, messageId, {
+      messageContent: nextContent,
+    });
+
+    await respond({
+      text: updated
+        ? `Updated chat history #${messageId}.`
+        : `No chat history row found for #${messageId}.`,
+    });
+    return;
+  }
+
+  if (subcommand === "set-intent") {
+    const messageId = args[1];
+    const nextIntent = args[2];
+
+    if (!messageId || !nextIntent) {
+      await respond({
+        text: "Usage: `/ach-history set-intent <message_id> <intent>`",
+      });
+      return;
+    }
+
+    const updated = updateChatHistoryRecord(userId, messageId, {
+      intent: nextIntent,
+    });
+
+    await respond({
+      text: updated
+        ? `Updated intent for chat history #${messageId} to ${nextIntent}.`
+        : `No chat history row found for #${messageId}.`,
+    });
+    return;
+  }
+
+  if (subcommand === "delete") {
+    const messageId = args[1];
+    if (!messageId) {
+      await respond({ text: "Usage: `/ach-history delete <message_id>`" });
+      return;
+    }
+
+    const deletedCount = deleteChatHistoryRecord(userId, messageId);
+    await respond({
+      text: deletedCount
+        ? `Deleted chat history #${messageId}.`
+        : `No chat history row found for #${messageId}.`,
+    });
+    return;
+  }
+
+  if (subcommand === "clear") {
+    const intent = args[1] === "intent" ? args[2] : null;
+    const deletedCount = clearChatHistory(userId, intent);
+    await respond({
+      text: intent
+        ? `Deleted ${deletedCount} chat history row(s) for intent ${intent}.`
+        : `Deleted ${deletedCount} chat history row(s).`,
+    });
+    return;
+  }
+
+  await respond({ text: "Unknown command. Try `/ach-history help`." });
+});
+
 app.command("/ach-all-in", async ({ command, ack, respond, client }) => {
   await ack();
   logProgress("slack", "Command acknowledged.");
@@ -338,12 +625,14 @@ app.command("/ach-all-in", async ({ command, ack, respond, client }) => {
   });
 
   logProgress("assistant", "Generating assistant reply and action plan.");
+  const activeTools = getActiveTools();
   const { reply: assistantResponse, actions } = await processRequest(
     userQuery,
     intent,
     {
       channelContext,
       sameIntentHistory,
+      availableTools: activeTools,
     },
   );
 
@@ -359,12 +648,19 @@ app.command("/ach-all-in", async ({ command, ack, respond, client }) => {
 
   let finalResponse = assistantResponse;
   let actionResults = [];
+  const activeToolNames = new Set(activeTools.map((tool) => tool.name));
 
   if (actions && actions.length > 0) {
     // Wait for all actions to execute
     logProgress("actions", `Executing ${actions.length} action(s).`);
     actionResults = await Promise.all(
-      actions.map((action) => executeAction(action)),
+      actions.map((action) => {
+        if (!activeToolNames.has(action.action_name)) {
+          return `Tool '${action.action_name}' is disabled or unavailable.`;
+        }
+
+        return executeAction(action);
+      }),
     );
     console.log(`[DEBUG] Action results:`, actionResults);
   } else {
