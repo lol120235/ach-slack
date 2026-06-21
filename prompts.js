@@ -37,7 +37,12 @@ Respond ONLY in JSON with these fields:
   "summary": "short summary"
 }
 
-Be precise and avoid additional commentary. Do NOT wrap the JSON output in markdown codeblocks like \`\`\`json.
+JSON rules:
+- Output exactly one JSON object.
+- The first character must be { and the final character must be }.
+- Use double quotes for every JSON key and string value.
+- Do not include markdown, code fences, comments, prose, or trailing commas.
+- Do not add fields beyond the requested schema.
 `,
   user: `
 User message:
@@ -139,13 +144,18 @@ Task:
 Return ONLY valid JSON with the structure:
 {
   "reply": "text to send to user",
-  "actions": [ // optional
+  "actions": [
     { "action_name": "name_of_the_tool", "parameters": { "key": "value" } }
   ]
 }
 
 Keep the reply concise (one or two short paragraphs) and friendly.
-Do NOT wrap the JSON output in markdown codeblocks like \`\`\`json.
+JSON rules:
+- Output exactly one JSON object.
+- The first character must be { and the final character must be }.
+- Use double quotes for every JSON key and string value.
+- Do not include markdown, code fences, comments, prose, or trailing commas.
+- If no tool action is needed, use "actions": [].
 `,
   user: `
 User message:
@@ -208,7 +218,12 @@ Return ONLY valid JSON with this structure:
   "implementation_notes": ["short note"]
 }
 
-Do NOT wrap the JSON output in markdown codeblocks like \`\`\`json.
+JSON rules:
+- Output exactly one JSON object.
+- The first character must be { and the final character must be }.
+- Use double quotes for every JSON key and string value.
+- Do not include markdown, code fences, comments, prose, or trailing commas.
+- Do not add fields beyond the requested schema.
 `,
   user: `
 Validated API-tool spec:

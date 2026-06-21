@@ -189,6 +189,31 @@ const SUPPORTED_EXCHANGE_RATE_CURRENCIES = new Set([
 let lastExchangeRateRequestAt = 0;
 const lastCustomApiToolRequestAt = new Map();
 
+const ANALYZE_MESSAGE_SCHEMA = `
+{
+  "intent": "one of the available intents",
+  "summary": "short summary"
+}
+`.trim();
+
+const PROCESS_REQUEST_SCHEMA = `
+{
+  "reply": "text to send to user",
+  "actions": [
+    { "action_name": "name_of_the_tool", "parameters": { "key": "value" } }
+  ]
+}
+`.trim();
+
+const TOOL_CUSTOMIZATION_REVIEW_SCHEMA = `
+{
+  "summary": "short summary",
+  "recommendation": "approve_for_coding | needs_clarification | reject",
+  "security_notes": ["short note"],
+  "implementation_notes": ["short note"]
+}
+`.trim();
+
 function logPromptMessages(label, messages) {
   if (!LOG_PROMPTS) return;
 
@@ -200,11 +225,56 @@ function logPromptMessages(label, messages) {
   console.log(`[PROMPT:${label}] END\n`);
 }
 
-function parseJsonResponse(response, requestName) {
-  const cleanedResponse = response
+function stripJsonFences(response) {
+  return String(response || "")
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/i, "");
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function extractBalancedJsonObject(response) {
+  const text = stripJsonFences(response);
+  const startIndex = text.indexOf("{");
+  if (startIndex === -1) return text;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = startIndex; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+
+    if (depth === 0) {
+      return text.slice(startIndex, index + 1);
+    }
+  }
+
+  return text;
+}
+
+function parseJsonResponse(response, requestName) {
+  const cleanedResponse = extractBalancedJsonObject(response);
 
   try {
     return JSON.parse(cleanedResponse);
@@ -212,6 +282,92 @@ function parseJsonResponse(response, requestName) {
     console.error(`[ERROR] Failed to parse ${requestName} JSON:`, response);
     throw error;
   }
+}
+
+function buildJsonRepairMessages(requestName, response, schemaDescription) {
+  return [
+    {
+      role: "system",
+      content:
+        "You repair malformed model output into valid JSON. Output exactly one JSON object and nothing else. Do not use markdown. Do not explain.",
+    },
+    {
+      role: "user",
+      content: `
+Task name: ${requestName}
+
+Required schema:
+${schemaDescription}
+
+Malformed output:
+"""
+${response}
+"""
+`,
+    },
+  ];
+}
+
+async function parseJsonResponseWithRepair({
+  response,
+  requestName,
+  model,
+  schemaDescription,
+}) {
+  try {
+    return parseJsonResponse(response, requestName);
+  } catch (error) {
+    console.warn(
+      `[WARN] ${requestName} returned malformed JSON. Attempting one JSON repair pass.`,
+    );
+  }
+
+  const repairMessages = buildJsonRepairMessages(
+    requestName,
+    response,
+    schemaDescription,
+  );
+  logPromptMessages(`${requestName}:jsonRepair`, repairMessages);
+
+  const repairedResponse = await generateResponse(repairMessages, {
+    model,
+    requestName: `${requestName}:jsonRepair`,
+    temperature: 0,
+  });
+
+  console.log(`[DEBUG] ${requestName} repaired JSON response: ${repairedResponse}`);
+
+  return parseJsonResponse(repairedResponse, `${requestName}:jsonRepair`);
+}
+
+function normalizeAnalyzeMessageResult(result) {
+  return {
+    intent: typeof result.intent === "string" ? result.intent : "general_question",
+    summary: typeof result.summary === "string" ? result.summary : "",
+  };
+}
+
+function normalizeProcessRequestResult(result) {
+  return {
+    reply: typeof result.reply === "string" ? result.reply : "",
+    actions: Array.isArray(result.actions) ? result.actions : [],
+  };
+}
+
+function normalizeToolCustomizationReviewResult(result) {
+  return {
+    summary: typeof result.summary === "string" ? result.summary : "",
+    recommendation:
+      typeof result.recommendation === "string"
+        ? result.recommendation
+        : "needs_clarification",
+    security_notes: Array.isArray(result.security_notes)
+      ? result.security_notes
+      : [],
+    implementation_notes: Array.isArray(result.implementation_notes)
+      ? result.implementation_notes
+      : [],
+  };
 }
 
 function summarizeRequestError(error) {
@@ -500,16 +656,23 @@ async function analyzeMessage(userMessage) {
 
   logPromptMessages("analyzeMessage", messages);
 
+  const model = FAST_MODEL;
   const response = await generateResponse(messages, {
     model: FAST_MODEL,
     requestName: "analyzeMessage",
+    temperature: 0.2,
   });
 
   console.log(`[DEBUG] analyzeMessage raw response: ${response}`);
 
-  const messageAnalysis = parseJsonResponse(response, "analyzeMessage");
+  const messageAnalysis = await parseJsonResponseWithRepair({
+    response,
+    requestName: "analyzeMessage",
+    model,
+    schemaDescription: ANALYZE_MESSAGE_SCHEMA,
+  });
 
-  return messageAnalysis;
+  return normalizeAnalyzeMessageResult(messageAnalysis);
 }
 
 function formatRecords(records, emptyMessage, formatter) {
@@ -570,14 +733,23 @@ async function processRequest(userMessage, intent, context = {}) {
 
   logPromptMessages("processRequest", messages);
 
+  const model = ACCURATE_MODEL;
   const response = await generateResponse(messages, {
     model: ACCURATE_MODEL,
     requestName: "processRequest",
+    temperature: 0.2,
   });
 
   console.log(`[DEBUG] processRequest raw response: ${response}`);
 
-  return parseJsonResponse(response, "processRequest");
+  const processResult = await parseJsonResponseWithRepair({
+    response,
+    requestName: "processRequest",
+    model,
+    schemaDescription: PROCESS_REQUEST_SCHEMA,
+  });
+
+  return normalizeProcessRequestResult(processResult);
 }
 
 async function executeAction(action) {
@@ -747,6 +919,7 @@ async function reviewToolCustomizationRequest(requestText, availableTools = tool
 
   logPromptMessages("reviewToolCustomizationRequest", messages);
 
+  const model = FAST_MODEL;
   const response = await generateResponse(messages, {
     model: FAST_MODEL,
     requestName: "reviewToolCustomizationRequest",
@@ -757,7 +930,14 @@ async function reviewToolCustomizationRequest(requestText, availableTools = tool
     `[DEBUG] reviewToolCustomizationRequest raw response: ${response}`,
   );
 
-  return parseJsonResponse(response, "reviewToolCustomizationRequest");
+  const reviewResult = await parseJsonResponseWithRepair({
+    response,
+    requestName: "reviewToolCustomizationRequest",
+    model,
+    schemaDescription: TOOL_CUSTOMIZATION_REVIEW_SCHEMA,
+  });
+
+  return normalizeToolCustomizationReviewResult(reviewResult);
 }
 
 async function formatWithPersonality(
