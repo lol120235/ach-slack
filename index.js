@@ -2,6 +2,7 @@ require("dotenv").config();
 
 require("./database-init.js");
 
+const net = require("node:net");
 const { App } = require("@slack/bolt");
 
 const {
@@ -39,6 +40,70 @@ const DISABLED_TOOLS_SETTING_KEY = "disabled_tools";
 const MAX_PERSONALITY_PROMPT_CHARS = 4000;
 const MAX_TOOL_REQUEST_CHARS = 4000;
 const DEFAULT_HISTORY_COMMAND_LIMIT = 10;
+const CUSTOM_TOOL_SPEC_VERSION = 1;
+const CUSTOM_TOOL_ALLOWED_METHODS = new Set(["GET", "POST"]);
+const CUSTOM_TOOL_ALLOWED_AUTH_TYPES = new Set([
+  "none",
+  "bearer_env",
+  "api_key_env",
+]);
+const CUSTOM_TOOL_ALLOWED_AUTH_LOCATIONS = new Set(["header", "query"]);
+const CUSTOM_TOOL_ALLOWED_AUTH_KEYS = new Set([
+  "type",
+  "env_var",
+  "name",
+  "location",
+]);
+const CUSTOM_TOOL_ALLOWED_PARAM_TYPES = new Set([
+  "string",
+  "number",
+  "integer",
+  "boolean",
+]);
+const CUSTOM_TOOL_ALLOWED_TOP_LEVEL_KEYS = new Set([
+  "name",
+  "description",
+  "method",
+  "url",
+  "parameters",
+  "auth",
+  "timeout_ms",
+  "response_path",
+  "result_template",
+]);
+const CUSTOM_TOOL_ALLOWED_PARAM_KEYS = new Set([
+  "type",
+  "required",
+  "pattern",
+  "enum",
+  "min",
+  "max",
+]);
+
+const CUSTOM_TOOL_SPEC_EXAMPLE = {
+  name: "get_exchange_rate",
+  description: "Get the latest exchange rate between two currencies.",
+  method: "GET",
+  url: "https://api.frankfurter.dev/v2/rate/{base_currency}/{target_currency}",
+  parameters: {
+    base_currency: {
+      type: "string",
+      required: true,
+      pattern: "^[A-Z]{3}$",
+    },
+    target_currency: {
+      type: "string",
+      required: true,
+      pattern: "^[A-Z]{3}$",
+    },
+  },
+  auth: {
+    type: "none",
+  },
+  timeout_ms: 5000,
+  response_path: "rate",
+  result_template: "1 {base_currency} = {rate} {target_currency}",
+};
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -103,6 +168,337 @@ function formatToolsForSlack(toolList = toolsList) {
       return `- ${tool.name} (${status}): ${tool.description} Parameters: ${parameters || "none"}.`;
     })
     .join("\n");
+}
+
+function isPlainObject(value) {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  );
+}
+
+function stripJsonCodeFence(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function formatCustomToolSpecExample() {
+  return slackCodeBlock(JSON.stringify(CUSTOM_TOOL_SPEC_EXAMPLE, null, 2));
+}
+
+function extractPlaceholders(value) {
+  return new Set(
+    [...String(value || "").matchAll(/\{([a-zA-Z][a-zA-Z0-9_]*)\}/g)].map(
+      (match) => match[1],
+    ),
+  );
+}
+
+function isPrivateOrLocalIp(hostname) {
+  const ipVersion = net.isIP(hostname);
+  if (!ipVersion) return false;
+
+  if (ipVersion === 6) {
+    const normalizedHost = hostname.toLowerCase();
+    return (
+      normalizedHost === "::1" ||
+      normalizedHost.startsWith("fc") ||
+      normalizedHost.startsWith("fd") ||
+      normalizedHost.startsWith("fe80:")
+    );
+  }
+
+  const [first, second] = hostname.split(".").map(Number);
+  return (
+    first === 10 ||
+    first === 127 ||
+    first === 0 ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168)
+  );
+}
+
+function validateRegexPattern(pattern, path, errors) {
+  if (typeof pattern !== "string" || pattern.length > 200) {
+    errors.push(`${path} must be a regex string up to 200 characters.`);
+    return;
+  }
+
+  try {
+    new RegExp(pattern);
+  } catch (error) {
+    errors.push(`${path} is not a valid regex pattern.`);
+  }
+}
+
+function validateCustomToolSpec(spec) {
+  const errors = [];
+
+  if (!isPlainObject(spec)) {
+    return ["Tool spec must be a JSON object."];
+  }
+
+  Object.keys(spec).forEach((key) => {
+    if (!CUSTOM_TOOL_ALLOWED_TOP_LEVEL_KEYS.has(key)) {
+      errors.push(`Unknown top-level key: ${key}.`);
+    }
+  });
+
+  [
+    "name",
+    "description",
+    "method",
+    "url",
+    "parameters",
+    "auth",
+    "timeout_ms",
+    "response_path",
+    "result_template",
+  ].forEach((key) => {
+    if (spec[key] === undefined) errors.push(`Missing required key: ${key}.`);
+  });
+
+  if (
+    typeof spec.name !== "string" ||
+    !/^[a-z][a-z0-9_]{2,39}$/.test(spec.name)
+  ) {
+    errors.push(
+      "name must be 3-40 chars, snake_case, and start with a lowercase letter.",
+    );
+  }
+
+  if (
+    typeof spec.description !== "string" ||
+    spec.description.length < 10 ||
+    spec.description.length > 240
+  ) {
+    errors.push("description must be a string from 10 to 240 characters.");
+  }
+
+  const method =
+    typeof spec.method === "string" ? spec.method.toUpperCase() : spec.method;
+  if (!CUSTOM_TOOL_ALLOWED_METHODS.has(method)) {
+    errors.push("method must be GET or POST.");
+  }
+
+  let parsedUrl;
+  if (typeof spec.url !== "string" || spec.url.length > 500) {
+    errors.push("url must be an HTTPS URL string up to 500 characters.");
+  } else {
+    try {
+      parsedUrl = new URL(spec.url);
+      if (parsedUrl.protocol !== "https:") {
+        errors.push("url must use https.");
+      }
+      if (parsedUrl.username || parsedUrl.password) {
+        errors.push("url must not contain credentials.");
+      }
+      if (extractPlaceholders(parsedUrl.origin).size > 0) {
+        errors.push("url must not contain placeholders in the scheme or host.");
+      }
+      if (
+        parsedUrl.hostname === "localhost" ||
+        parsedUrl.hostname.endsWith(".localhost") ||
+        isPrivateOrLocalIp(parsedUrl.hostname)
+      ) {
+        errors.push("url must not target localhost or private IP ranges.");
+      }
+    } catch (error) {
+      errors.push("url must be a valid absolute URL.");
+    }
+  }
+
+  if (!isPlainObject(spec.parameters)) {
+    errors.push("parameters must be an object.");
+  }
+
+  const parameterNames = isPlainObject(spec.parameters)
+    ? Object.keys(spec.parameters)
+    : [];
+
+  if (parameterNames.length > 8) {
+    errors.push("parameters can define at most 8 parameters.");
+  }
+
+  parameterNames.forEach((parameterName) => {
+    const parameter = spec.parameters[parameterName];
+    const parameterPath = `parameters.${parameterName}`;
+
+    if (!/^[a-z][a-z0-9_]{0,39}$/.test(parameterName)) {
+      errors.push(`${parameterPath} must use snake_case.`);
+    }
+
+    if (!isPlainObject(parameter)) {
+      errors.push(`${parameterPath} must be an object.`);
+      return;
+    }
+
+    Object.keys(parameter).forEach((key) => {
+      if (!CUSTOM_TOOL_ALLOWED_PARAM_KEYS.has(key)) {
+        errors.push(`Unknown key: ${parameterPath}.${key}.`);
+      }
+    });
+
+    if (!CUSTOM_TOOL_ALLOWED_PARAM_TYPES.has(parameter.type)) {
+      errors.push(
+        `${parameterPath}.type must be string, number, integer, or boolean.`,
+      );
+    }
+
+    if (typeof parameter.required !== "boolean") {
+      errors.push(`${parameterPath}.required must be true or false.`);
+    }
+
+    if (parameter.type === "string" && !parameter.pattern && !parameter.enum) {
+      errors.push(
+        `${parameterPath} must define either pattern or enum for validation.`,
+      );
+    }
+
+    if (parameter.pattern !== undefined) {
+      validateRegexPattern(parameter.pattern, `${parameterPath}.pattern`, errors);
+    }
+
+    if (parameter.enum !== undefined) {
+      if (
+        !Array.isArray(parameter.enum) ||
+        parameter.enum.length === 0 ||
+        parameter.enum.length > 100 ||
+        parameter.enum.some((item) => typeof item !== "string")
+      ) {
+        errors.push(
+          `${parameterPath}.enum must be a non-empty string array up to 100 items.`,
+        );
+      }
+    }
+
+    if (
+      parameter.min !== undefined &&
+      (typeof parameter.min !== "number" || !Number.isFinite(parameter.min))
+    ) {
+      errors.push(`${parameterPath}.min must be a finite number.`);
+    }
+
+    if (
+      parameter.max !== undefined &&
+      (typeof parameter.max !== "number" || !Number.isFinite(parameter.max))
+    ) {
+      errors.push(`${parameterPath}.max must be a finite number.`);
+    }
+  });
+
+  if (!isPlainObject(spec.auth)) {
+    errors.push("auth must be an object.");
+  } else {
+    Object.keys(spec.auth).forEach((key) => {
+      if (!CUSTOM_TOOL_ALLOWED_AUTH_KEYS.has(key)) {
+        errors.push(`Unknown auth key: auth.${key}.`);
+      }
+    });
+
+    if (!CUSTOM_TOOL_ALLOWED_AUTH_TYPES.has(spec.auth.type)) {
+      errors.push("auth.type must be none, bearer_env, or api_key_env.");
+    }
+
+    if (spec.auth.type === "none") {
+      const extraAuthKeys = Object.keys(spec.auth).filter((key) => key !== "type");
+      if (extraAuthKeys.length > 0) {
+        errors.push("auth with type none must not include extra keys.");
+      }
+    } else {
+      if (
+        typeof spec.auth.env_var !== "string" ||
+        !/^[A-Z][A-Z0-9_]{1,79}$/.test(spec.auth.env_var)
+      ) {
+        errors.push(
+          "auth.env_var must reference an uppercase environment variable name.",
+        );
+      }
+
+      if (typeof spec.auth.name !== "string" || !spec.auth.name.trim()) {
+        errors.push("auth.name must name the header or query parameter.");
+      }
+
+      if (!CUSTOM_TOOL_ALLOWED_AUTH_LOCATIONS.has(spec.auth.location)) {
+        errors.push("auth.location must be header or query.");
+      }
+    }
+  }
+
+  if (
+    typeof spec.timeout_ms !== "number" ||
+    !Number.isInteger(spec.timeout_ms) ||
+    spec.timeout_ms < 1000 ||
+    spec.timeout_ms > 10000
+  ) {
+    errors.push("timeout_ms must be an integer from 1000 to 10000.");
+  }
+
+  if (
+    typeof spec.response_path !== "string" ||
+    !/^[a-zA-Z0-9_.$[\]]{1,120}$/.test(spec.response_path)
+  ) {
+    errors.push(
+      "response_path must be a simple property path up to 120 characters.",
+    );
+  }
+
+  if (
+    typeof spec.result_template !== "string" ||
+    spec.result_template.length < 5 ||
+    spec.result_template.length > 240
+  ) {
+    errors.push("result_template must be a string from 5 to 240 characters.");
+  }
+
+  const urlPlaceholders = extractPlaceholders(spec.url);
+  const templatePlaceholders = extractPlaceholders(spec.result_template);
+  const declaredParameterNames = new Set(parameterNames);
+  const allowedTemplatePlaceholders = new Set([
+    ...parameterNames,
+    "result",
+    "rate",
+    "date",
+  ]);
+
+  urlPlaceholders.forEach((placeholder) => {
+    if (!declaredParameterNames.has(placeholder)) {
+      errors.push(`url placeholder {${placeholder}} is not a declared parameter.`);
+    }
+  });
+
+  templatePlaceholders.forEach((placeholder) => {
+    if (!allowedTemplatePlaceholders.has(placeholder)) {
+      errors.push(
+        `result_template placeholder {${placeholder}} is not allowed.`,
+      );
+    }
+  });
+
+  return errors;
+}
+
+function parseCustomToolSpec(requestText) {
+  const cleanedRequestText = stripJsonCodeFence(requestText);
+  const spec = JSON.parse(cleanedRequestText);
+  const errors = validateCustomToolSpec(spec);
+
+  if (errors.length > 0) {
+    const error = new Error(errors.join("\n"));
+    error.validationErrors = errors;
+    throw error;
+  }
+
+  return {
+    ...spec,
+    method: spec.method.toUpperCase(),
+    spec_version: CUSTOM_TOOL_SPEC_VERSION,
+  };
 }
 
 function formatReviewList(items) {
@@ -294,26 +690,49 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
 
   initUser(userId, username);
 
-  if (!text || lowerText === "help" || lowerText === "list") {
+  if (!text || lowerText === "help") {
     await respond({
       text:
-        "Runtime tool customization is intentionally disabled for security. This command records a source-code tool request and runs a security review before anyone implements it.\n\n" +
+        "Runtime tool customization is disabled for security. This command now accepts only a strict JSON API-tool spec, validates it locally, then records a source-code implementation request.\n\n" +
         "Usage:\n" +
         "- `/ach-customize-tool list`\n" +
-        "- `/ach-customize-tool request <describe the tool you want>`\n\n" +
-        "Current available tools:\n" +
-        formatToolsForSlack(),
+        "- `/ach-customize-tool example`\n" +
+        "- `/ach-customize-tool request {json spec}`\n\n" +
+        "Required JSON shape:\n" +
+        formatCustomToolSpecExample(),
     });
     return;
   }
 
-  const requestText = lowerText.startsWith("request ")
-    ? text.slice(8).trim()
+  if (lowerText === "list") {
+    await respond({
+      text:
+        "Current available tools:\n" +
+        formatToolsForSlack() +
+        "\n\nUse `/ach-customize-tool example` for the strict request format.",
+    });
+    return;
+  }
+
+  if (lowerText === "example") {
+    await respond({
+      text:
+        "Example strict API-tool spec:\n" +
+        formatCustomToolSpecExample(),
+    });
+    return;
+  }
+
+  const requestText = /^request\s+/i.test(text)
+    ? text.replace(/^request\s+/i, "").trim()
     : text;
 
   if (!requestText) {
     await respond({
-      text: "Please describe the tool you want after `/ach-customize-tool request`.",
+      text:
+        "Please provide a JSON spec after `/ach-customize-tool request`.\n\n" +
+        "Example:\n" +
+        formatCustomToolSpecExample(),
     });
     return;
   }
@@ -325,11 +744,37 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
     return;
   }
 
-  logProgress("tools", "Running security review for tool customization request.");
+  let toolSpec;
+  try {
+    toolSpec = parseCustomToolSpec(requestText);
+  } catch (error) {
+    const validationErrors = error.validationErrors || [
+      `Invalid JSON: ${error.message}`,
+    ];
+    await respond({
+      text:
+        "Tool spec rejected before LLM review. Please fix these issues:\n" +
+        formatReviewList(validationErrors) +
+        "\n\nExpected format:\n" +
+        formatCustomToolSpecExample(),
+    });
+    return;
+  }
+
+  const existingTool = getToolByName(toolSpec.name);
+  const normalizedRequestText = JSON.stringify(toolSpec, null, 2);
+
+  logProgress(
+    "tools",
+    `Validated strict API-tool spec for ${toolSpec.name}. Running security review.`,
+  );
 
   let review;
   try {
-    review = await reviewToolCustomizationRequest(requestText, getActiveTools());
+    review = await reviewToolCustomizationRequest(
+      normalizedRequestText,
+      getActiveTools(),
+    );
   } catch (error) {
     const failureReason = error.safeSummary || error.message || "Unknown error";
     console.error(
@@ -348,6 +793,13 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
   }
   review = normalizeToolReview(review);
 
+  if (existingTool) {
+    review.implementation_notes = [
+      `Tool name ${toolSpec.name} already exists; implement this as an update to the existing source-code tool, not as a duplicate.`,
+      ...review.implementation_notes,
+    ];
+  }
+
   const allowedStatuses = new Set([
     "approve_for_coding",
     "needs_clarification",
@@ -360,7 +812,7 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
   const requestId = createToolCustomizationRequest({
     userId,
     channelId,
-    requestText,
+    requestText: normalizedRequestText,
     review,
     status,
   });
@@ -373,13 +825,16 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
   await respond({
     text:
       `Tool customization request #${requestId} recorded.\n\n` +
-      "Runtime tool creation from Slack is not enabled; this needs a source-code change so credentials, inputs, side effects, and network access can be reviewed properly.\n\n" +
+      "Runtime tool creation from Slack is not enabled; this validated API spec needs a source-code change so credentials, inputs, side effects, and network access can be reviewed properly.\n\n" +
+      `Tool: ${toolSpec.name}${existingTool ? " (existing tool update)" : ""}\n` +
       `Recommendation: ${status}\n` +
       `Summary: ${review.summary}\n\n` +
       "Security notes:\n" +
       formatReviewList(review.security_notes) +
       "\n\nImplementation notes:\n" +
-      formatReviewList(review.implementation_notes),
+      formatReviewList(review.implementation_notes) +
+      "\n\nValidated spec:\n" +
+      slackCodeBlock(normalizedRequestText),
   });
 });
 

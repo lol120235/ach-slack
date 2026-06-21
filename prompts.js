@@ -188,14 +188,15 @@ const toolCustomizationReviewTemplate = {
   system: `
 You are a security-focused engineering reviewer for Slack bot tool integrations.
 
-Runtime tool creation from Slack text is disabled. Your job is to review the requested tool as a source-code change proposal.
+Runtime tool creation from Slack text is disabled. The user request has already passed local strict JSON schema validation for an API-tool proposal. Your job is to review the validated API spec as a source-code change proposal.
 
 Current available tools:
 {availableTools}
 
 Assess:
 - Whether the request is safe to implement in source code.
-- Required secrets, allowlists, input validation, rate limits, and user confirmation.
+- Whether the declared URL, auth mode, parameters, response path, timeout, and result template are sufficient.
+- Required secrets, allowlists, input validation, rate limits, logging redaction, and user confirmation.
 - Any dangerous behaviors such as arbitrary code execution, shell access, filesystem writes, credential exposure, SSRF, or unbounded network requests.
 - Minimal implementation notes for a developer.
 
@@ -210,7 +211,7 @@ Return ONLY valid JSON with this structure:
 Do NOT wrap the JSON output in markdown codeblocks like \`\`\`json.
 `,
   user: `
-Requested tool customization:
+Validated API-tool spec:
 """
 {requestText}
 """
