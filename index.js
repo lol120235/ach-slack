@@ -9,6 +9,7 @@ const {
   analyzeMessage,
   processRequest,
   executeAction,
+  executeCustomApiTool,
   reviewToolCustomizationRequest,
   formatWithPersonality,
 } = require("./ai-api.js");
@@ -32,6 +33,9 @@ const {
   setSetting,
   deleteSetting,
   createToolCustomizationRequest,
+  upsertCustomApiTool,
+  listCustomApiTools,
+  getCustomApiTool,
 } = require("./database-settings.js");
 
 const CONTEXT_MESSAGE_LIMIT = 15;
@@ -149,23 +153,59 @@ function saveDisabledToolNames(disabledToolNames) {
   );
 }
 
+function customApiToolToPromptTool(customTool) {
+  const parameters = Object.fromEntries(
+    Object.entries(customTool.spec.parameters || {}).map(([name, spec]) => {
+      const required = spec.required ? "required" : "optional";
+      const validation = spec.enum
+        ? `one of ${spec.enum.join(", ")}`
+        : spec.pattern
+          ? `pattern ${spec.pattern}`
+          : spec.type;
+
+      return [name, `${spec.type}, ${required}, ${validation}`];
+    }),
+  );
+
+  return {
+    name: customTool.tool_name,
+    description: customTool.spec.description,
+    parameters,
+    custom: true,
+  };
+}
+
+function getCustomToolRows() {
+  return listCustomApiTools();
+}
+
+function getAllTools() {
+  const customTools = getCustomToolRows().map(customApiToolToPromptTool);
+  return [...toolsList, ...customTools];
+}
+
 function getActiveTools() {
   const disabledToolNames = getDisabledToolNames();
-  return toolsList.filter((tool) => !disabledToolNames.has(tool.name));
+  return getAllTools().filter((tool) => !disabledToolNames.has(tool.name));
 }
 
 function getToolByName(toolName) {
+  return getAllTools().find((tool) => tool.name === toolName);
+}
+
+function getBuiltInToolByName(toolName) {
   return toolsList.find((tool) => tool.name === toolName);
 }
 
-function formatToolsForSlack(toolList = toolsList) {
+function formatToolsForSlack(toolList = getAllTools()) {
   const disabledToolNames = getDisabledToolNames();
 
   return toolList
     .map((tool) => {
       const parameters = Object.keys(tool.parameters || {}).join(", ");
       const status = disabledToolNames.has(tool.name) ? "disabled" : "active";
-      return `- ${tool.name} (${status}): ${tool.description} Parameters: ${parameters || "none"}.`;
+      const source = tool.custom ? "custom" : "built-in";
+      return `- ${tool.name} (${status}, ${source}): ${tool.description} Parameters: ${parameters || "none"}.`;
     })
     .join("\n");
 }
@@ -693,7 +733,7 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
   if (!text || lowerText === "help") {
     await respond({
       text:
-        "Runtime tool customization is disabled for security. This command now accepts only a strict JSON API-tool spec, validates it locally, then records a source-code implementation request.\n\n" +
+        "This command accepts only a strict JSON API-tool spec. It validates the spec locally, runs a security review, and registers approved non-built-in API tools at runtime.\n\n" +
         "Usage:\n" +
         "- `/ach-customize-tool list`\n" +
         "- `/ach-customize-tool example`\n" +
@@ -761,7 +801,8 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
     return;
   }
 
-  const existingTool = getToolByName(toolSpec.name);
+  const existingBuiltInTool = getBuiltInToolByName(toolSpec.name);
+  const existingCustomTool = getCustomApiTool(toolSpec.name);
   const normalizedRequestText = JSON.stringify(toolSpec, null, 2);
 
   logProgress(
@@ -793,7 +834,7 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
   }
   review = normalizeToolReview(review);
 
-  if (existingTool) {
+  if (existingBuiltInTool) {
     review.implementation_notes = [
       `Tool name ${toolSpec.name} already exists; implement this as an update to the existing source-code tool, not as a duplicate.`,
       ...review.implementation_notes,
@@ -817,6 +858,21 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
     status,
   });
 
+  let registrationMessage =
+    "Not registered as an active tool. Manual source-code work is still required.";
+
+  if (status === "approve_for_coding" && !existingBuiltInTool) {
+    upsertCustomApiTool({
+      toolName: toolSpec.name,
+      spec: toolSpec,
+      sourceRequestId: requestId,
+      createdBy: userId,
+    });
+    registrationMessage = existingCustomTool
+      ? "Updated existing custom API tool and made it active."
+      : "Registered as an active custom API tool.";
+  }
+
   logProgress(
     "tools",
     `Tool customization request #${requestId} saved with status ${status}.`,
@@ -825,8 +881,9 @@ app.command("/ach-customize-tool", async ({ command, ack, respond }) => {
   await respond({
     text:
       `Tool customization request #${requestId} recorded.\n\n` +
-      "Runtime tool creation from Slack is not enabled; this validated API spec needs a source-code change so credentials, inputs, side effects, and network access can be reviewed properly.\n\n" +
-      `Tool: ${toolSpec.name}${existingTool ? " (existing tool update)" : ""}\n` +
+      "Strict API-tool specs can be registered at runtime after local validation and approval. Built-in source-code tools still cannot be overwritten from Slack.\n\n" +
+      `Tool: ${toolSpec.name}${existingBuiltInTool ? " (built-in update request)" : ""}\n` +
+      `Registration: ${registrationMessage}\n` +
       `Recommendation: ${status}\n` +
       `Summary: ${review.summary}\n\n` +
       "Security notes:\n" +
@@ -1104,6 +1161,11 @@ app.command("/ach-all-in", async ({ command, ack, respond, client }) => {
   let finalResponse = assistantResponse;
   let actionResults = [];
   const activeToolNames = new Set(activeTools.map((tool) => tool.name));
+  const activeCustomToolsByName = new Map(
+    getCustomToolRows()
+      .filter((customTool) => activeToolNames.has(customTool.tool_name))
+      .map((customTool) => [customTool.tool_name, customTool.spec]),
+  );
 
   if (actions && actions.length > 0) {
     // Wait for all actions to execute
@@ -1112,6 +1174,11 @@ app.command("/ach-all-in", async ({ command, ack, respond, client }) => {
       actions.map((action) => {
         if (!activeToolNames.has(action.action_name)) {
           return `Tool '${action.action_name}' is disabled or unavailable.`;
+        }
+
+        const customToolSpec = activeCustomToolsByName.get(action.action_name);
+        if (customToolSpec) {
+          return executeCustomApiTool(action, customToolSpec);
         }
 
         return executeAction(action);

@@ -188,7 +188,7 @@ const toolCustomizationReviewTemplate = {
   system: `
 You are a security-focused engineering reviewer for Slack bot tool integrations.
 
-Runtime tool creation from Slack text is disabled. The user request has already passed local strict JSON schema validation for an API-tool proposal. Your job is to review the validated API spec as a source-code change proposal.
+The user request has already passed local strict JSON schema validation for an API-tool proposal. Approved non-built-in API tools may be registered as runtime custom API tools. Built-in source-code tools cannot be overwritten from Slack. Your job is to review the validated API spec before registration.
 
 Current available tools:
 {availableTools}

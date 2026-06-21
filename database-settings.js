@@ -64,9 +64,58 @@ function createToolCustomizationRequest({
   return result.lastInsertRowid;
 }
 
+function upsertCustomApiTool({ toolName, spec, sourceRequestId, createdBy }) {
+  const query = database.prepare(`
+    INSERT INTO custom_api_tools (
+      tool_name,
+      spec_json,
+      source_request_id,
+      created_by,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(tool_name) DO UPDATE SET
+      spec_json = excluded.spec_json,
+      source_request_id = excluded.source_request_id,
+      updated_at = CURRENT_TIMESTAMP
+  `);
+
+  query.run(toolName, JSON.stringify(spec), sourceRequestId, createdBy);
+}
+
+function listCustomApiTools() {
+  const query = database.prepare(`
+    SELECT * FROM custom_api_tools
+    ORDER BY tool_name ASC
+  `);
+
+  return query.all().map((row) => ({
+    ...row,
+    spec: JSON.parse(row.spec_json),
+  }));
+}
+
+function getCustomApiTool(toolName) {
+  const query = database.prepare(`
+    SELECT * FROM custom_api_tools
+    WHERE tool_name = ?
+  `);
+
+  const row = query.get(toolName);
+  if (!row) return null;
+
+  return {
+    ...row,
+    spec: JSON.parse(row.spec_json),
+  };
+}
+
 module.exports = {
   getSetting,
   setSetting,
   deleteSetting,
   createToolCustomizationRequest,
+  upsertCustomApiTool,
+  listCustomApiTools,
+  getCustomApiTool,
 };

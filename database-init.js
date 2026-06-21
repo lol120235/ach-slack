@@ -41,3 +41,17 @@ database.exec(`
     FOREIGN KEY (user_id) REFERENCES users (user_id)
   ) STRICT
 `);
+
+database.exec(`
+  CREATE TABLE IF NOT EXISTS custom_api_tools (
+    tool_name TEXT PRIMARY KEY,
+    spec_json TEXT NOT NULL,
+    source_request_id INTEGER,
+    created_by TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (created_by) REFERENCES users (user_id),
+    FOREIGN KEY (source_request_id) REFERENCES tool_customization_requests (request_id)
+  ) STRICT
+`);

@@ -1,4 +1,5 @@
 const axios = require("axios");
+const net = require("node:net");
 const {
   renderPrompt,
   analyzeMessageTemplate,
@@ -17,6 +18,7 @@ const FAST_MODEL = process.env.FAST_MODEL;
 const ACCURATE_MODEL = process.env.ACCURATE_MODEL;
 const EXCHANGE_RATE_TIMEOUT_MS = 5000;
 const EXCHANGE_RATE_MIN_INTERVAL_MS = 1000;
+const CUSTOM_API_TOOL_MIN_INTERVAL_MS = 1000;
 const SUPPORTED_EXCHANGE_RATE_CURRENCIES = new Set([
   "AED",
   "AFN",
@@ -185,6 +187,7 @@ const SUPPORTED_EXCHANGE_RATE_CURRENCIES = new Set([
   "ZWG",
 ]);
 let lastExchangeRateRequestAt = 0;
+const lastCustomApiToolRequestAt = new Map();
 
 function logPromptMessages(label, messages) {
   if (!LOG_PROMPTS) return;
@@ -244,6 +247,203 @@ function normalizeExchangeCurrencyCode(value) {
   if (!SUPPORTED_EXCHANGE_RATE_CURRENCIES.has(code)) return null;
 
   return code;
+}
+
+function isPrivateOrLocalIp(hostname) {
+  const ipVersion = net.isIP(hostname);
+  if (!ipVersion) return false;
+
+  if (ipVersion === 6) {
+    const normalizedHost = hostname.toLowerCase();
+    return (
+      normalizedHost === "::1" ||
+      normalizedHost.startsWith("fc") ||
+      normalizedHost.startsWith("fd") ||
+      normalizedHost.startsWith("fe80:")
+    );
+  }
+
+  const [first, second] = hostname.split(".").map(Number);
+  return (
+    first === 10 ||
+    first === 127 ||
+    first === 0 ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168)
+  );
+}
+
+function assertSafeCustomApiUrl(url) {
+  const parsedUrl = new URL(url);
+
+  if (parsedUrl.protocol !== "https:") {
+    throw new Error("Custom API tool URLs must use HTTPS.");
+  }
+
+  if (
+    parsedUrl.hostname === "localhost" ||
+    parsedUrl.hostname.endsWith(".localhost") ||
+    isPrivateOrLocalIp(parsedUrl.hostname)
+  ) {
+    throw new Error("Custom API tool URL targets a blocked host.");
+  }
+}
+
+function normalizeCustomApiParameterValue(name, parameterSpec, rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") {
+    if (parameterSpec.required) {
+      throw new Error(`Missing required parameter: ${name}.`);
+    }
+
+    return undefined;
+  }
+
+  let value = rawValue;
+
+  if (parameterSpec.type === "string") {
+    value = String(rawValue);
+
+    if (parameterSpec.pattern && !new RegExp(parameterSpec.pattern).test(value)) {
+      throw new Error(`Parameter ${name} does not match its required pattern.`);
+    }
+
+    if (parameterSpec.enum && !parameterSpec.enum.includes(value)) {
+      throw new Error(`Parameter ${name} is not an allowed value.`);
+    }
+  } else if (parameterSpec.type === "number") {
+    value = Number(rawValue);
+    if (!Number.isFinite(value)) {
+      throw new Error(`Parameter ${name} must be a number.`);
+    }
+  } else if (parameterSpec.type === "integer") {
+    value = Number(rawValue);
+    if (!Number.isInteger(value)) {
+      throw new Error(`Parameter ${name} must be an integer.`);
+    }
+  } else if (parameterSpec.type === "boolean") {
+    if (typeof rawValue === "boolean") {
+      value = rawValue;
+    } else if (rawValue === "true") {
+      value = true;
+    } else if (rawValue === "false") {
+      value = false;
+    } else {
+      throw new Error(`Parameter ${name} must be true or false.`);
+    }
+  }
+
+  if (
+    parameterSpec.min !== undefined &&
+    typeof value === "number" &&
+    value < parameterSpec.min
+  ) {
+    throw new Error(`Parameter ${name} must be at least ${parameterSpec.min}.`);
+  }
+
+  if (
+    parameterSpec.max !== undefined &&
+    typeof value === "number" &&
+    value > parameterSpec.max
+  ) {
+    throw new Error(`Parameter ${name} must be at most ${parameterSpec.max}.`);
+  }
+
+  return value;
+}
+
+function normalizeCustomApiParameters(spec, parameters = {}) {
+  return Object.entries(spec.parameters || {}).reduce(
+    (normalizedParameters, [name, parameterSpec]) => {
+      const value = normalizeCustomApiParameterValue(
+        name,
+        parameterSpec,
+        parameters[name],
+      );
+
+      if (value !== undefined) {
+        normalizedParameters[name] = value;
+      }
+
+      return normalizedParameters;
+    },
+    {},
+  );
+}
+
+function buildCustomApiUrl(spec, parameters) {
+  let url = spec.url;
+  const consumedParameters = new Set();
+
+  Object.entries(parameters).forEach(([name, value]) => {
+    const placeholder = `{${name}}`;
+    if (url.includes(placeholder)) {
+      url = url.replaceAll(placeholder, encodeURIComponent(String(value)));
+      consumedParameters.add(name);
+    }
+  });
+
+  const parsedUrl = new URL(url);
+  if (spec.method === "GET") {
+    Object.entries(parameters).forEach(([name, value]) => {
+      if (!consumedParameters.has(name)) {
+        parsedUrl.searchParams.set(name, String(value));
+      }
+    });
+  }
+
+  assertSafeCustomApiUrl(parsedUrl.href);
+
+  return {
+    url: parsedUrl.href,
+    bodyParameters: Object.fromEntries(
+      Object.entries(parameters).filter(([name]) => !consumedParameters.has(name)),
+    ),
+  };
+}
+
+function applyCustomApiAuth(spec, requestConfig) {
+  const auth = spec.auth || { type: "none" };
+  if (auth.type === "none") return;
+
+  const secret = process.env[auth.env_var];
+  if (!secret) {
+    throw new Error(`Missing required environment variable: ${auth.env_var}.`);
+  }
+
+  if (auth.type === "bearer_env") {
+    requestConfig.headers[auth.name] = `Bearer ${secret}`;
+    return;
+  }
+
+  if (auth.location === "header") {
+    requestConfig.headers[auth.name] = secret;
+    return;
+  }
+
+  requestConfig.params = {
+    ...(requestConfig.params || {}),
+    [auth.name]: secret,
+  };
+}
+
+function getResponsePathValue(data, path) {
+  const segments = [];
+  String(path).replace(/([^[.\]]+)|\[(\d+)\]/g, (_, property, index) => {
+    segments.push(property !== undefined ? property : Number(index));
+  });
+
+  return segments.reduce((value, segment) => {
+    if (value === undefined || value === null) return undefined;
+    return value[segment];
+  }, data);
+}
+
+function renderCustomApiResultTemplate(template, values) {
+  return String(template).replace(/\{([a-zA-Z][a-zA-Z0-9_]*)\}/g, (_, key) => {
+    const value = values[key];
+    return value === undefined || value === null ? "" : String(value);
+  });
 }
 
 async function generateResponse(messages, options = {}) {
@@ -472,6 +672,68 @@ async function executeAction(action) {
   }
 }
 
+async function executeCustomApiTool(action, spec) {
+  const { action_name, parameters } = action;
+  console.log(`Executing custom API tool: ${action_name}`, parameters);
+
+  try {
+    const now = Date.now();
+    const lastRequestAt = lastCustomApiToolRequestAt.get(spec.name) || 0;
+    if (now - lastRequestAt < CUSTOM_API_TOOL_MIN_INTERVAL_MS) {
+      return `Tool '${spec.name}' is being called too quickly. Please try again in a moment.`;
+    }
+    lastCustomApiToolRequestAt.set(spec.name, now);
+
+    const normalizedParameters = normalizeCustomApiParameters(
+      spec,
+      parameters,
+    );
+    const { url, bodyParameters } = buildCustomApiUrl(
+      spec,
+      normalizedParameters,
+    );
+    const requestConfig = {
+      method: spec.method,
+      url,
+      timeout: spec.timeout_ms,
+      headers: {},
+    };
+
+    applyCustomApiAuth(spec, requestConfig);
+
+    if (spec.method === "POST") {
+      requestConfig.data = bodyParameters;
+    }
+
+    const { data } = await axios.request(requestConfig);
+    const result = getResponsePathValue(data, spec.response_path);
+
+    if (result === undefined || result === null) {
+      return `Tool '${spec.name}' did not find a result at response_path '${spec.response_path}'.`;
+    }
+
+    return renderCustomApiResultTemplate(spec.result_template, {
+      ...normalizedParameters,
+      result,
+      rate: result,
+      date: data && data.date,
+    });
+  } catch (error) {
+    if (
+      /^Missing required parameter: /.test(error.message) ||
+      /^Parameter .+ (does not match|is not|must be)/.test(error.message)
+    ) {
+      return error.message;
+    }
+
+    console.error(
+      `Error executing custom API tool ${action_name}:`,
+      summarizeRequestError(error),
+    );
+    return `Failed to execute custom tool '${action_name}'. Please try again later.`;
+  }
+}
+
 async function reviewToolCustomizationRequest(requestText, availableTools = toolsList) {
   const rendered = renderPrompt(toolCustomizationReviewTemplate, {
     requestText,
@@ -532,6 +794,7 @@ module.exports = {
   analyzeMessage,
   processRequest,
   executeAction,
+  executeCustomApiTool,
   reviewToolCustomizationRequest,
   formatWithPersonality,
 };
